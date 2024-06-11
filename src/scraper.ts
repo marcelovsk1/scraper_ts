@@ -116,6 +116,139 @@ function openGoogleMaps(latitude: number, longitude: number): string {
     return `https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}`;
 }
 
+async function scrapeEventbriteEvents(browser: Browser, url: string, maxPages: number = 3): Promise<any[]> {
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle2' });
+    await page.setViewport({ width: 1280, height: 800 });
+
+    const allEvents: any[] = [];
+
+    for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+        console.log(`Scraping Eventbrite page ${pageNum}`);
+        await page.waitForTimeout(2000);
+
+        const pageContent = await page.content();
+        const $ = cheerio.load(pageContent);
+        const events = $('div.discover-search-desktop-card');
+
+        for (const event of events.toArray()) {
+            const eventLink = $(event).find('a.event-card-link');
+            if (!eventLink.length) {
+                continue;
+            }
+
+            const eventUrl = 'https://www.eventbrite.com' + (eventLink.attr('href')?.startsWith('/') ? eventLink.attr('href') : '');
+            try {
+                await page.goto(eventUrl, { waitUntil: 'networkidle2' });
+            } catch (e) {
+                console.log(`Timeout ao carregar o evento: ${eventUrl}`);
+                continue;
+            }
+
+            await page.waitForTimeout(2000);
+            const eventPageContent = await page.content();
+            const eventPage = cheerio.load(eventPageContent);
+
+            const eventTitleElem = eventPage('h1.event-title.css-0');
+            if (!eventTitleElem.length) {
+                await page.goBack();
+                continue;
+            }
+
+            let eventTitle = eventTitleElem.text().trim();
+            if (eventTitle.includes("Log InLog In")) {
+                eventTitle = eventTitle.replace("Log InLog In", "").trim();
+            }
+
+            const descriptionElem = eventPage('p.summary');
+            const description = descriptionElem.length ? descriptionElem.text().trim() : '';
+
+            const locationElem = eventPage('p.location-info__address-text');
+            const locationText = locationElem.length ? locationElem.text().trim() : '';
+
+            const [latitude, longitude] = await getCoordinates(locationText);
+            const googleMapsUrl = latitude && longitude ? openGoogleMaps(latitude, longitude) : '';
+
+            const locationDetails = {
+                'Location': locationText,
+                'Latitude': latitude,
+                'Longitude': longitude,
+                'GoogleMaps_URL': googleMapsUrl
+            };
+
+            const dateText = eventPage('span.date-info__full-datetime').text().trim() || '';
+            console.log("Date text:", dateText);
+
+            let startTime: string | null = null;
+            let endTime: string | null = null;
+
+            if (dateText) {
+                const match = dateText.match(/(\d{1,2}:\d{2}\s?[AP]M)\s?–\s?(\d{1,2}:\d{2}\s?[AP]M)/);
+                if (match) {
+                    [startTime, endTime] = match.slice(1);
+                } else if (dateText.toLowerCase().includes("at")) {
+                    const timeMatch = dateText.match(/(\d{1,2}:\d{2}\s?[AP]M)/);
+                    if (timeMatch) {
+                        startTime = timeMatch[1];
+                    }
+                }
+            }
+
+            if (!eventTitle || !dateText || !locationText) {
+                await page.goBack();
+                continue;
+            }
+
+            const formattedDates = formatDate(dateText);
+            if (!formattedDates) {
+                console.log(`Ignoring event with invalid date: ${eventTitle}`);
+                await page.goBack();
+                continue;
+            }
+
+            const [formattedStartDate, formattedEndDate] = formattedDates;
+            const eventUUID = generateEventUUID(eventTitle, formattedStartDate, locationText);
+
+            const priceElem = eventPage('div.conversion-bar__panel-info');
+            const price = priceElem.length ? priceElem.text().trim() : 'undisclosed price';
+
+            const imageElem = eventPage('img.event-card-image');
+            const imageURL = imageElem.attr('src') || '';
+
+            const organizerElem = eventPage('div.descriptive-organizer-info-mobile__name');
+            const organizer = organizerElem.length ? organizerElem.text().trim() : '';
+
+            const eventInfo = {
+                'Title': eventTitle,
+                'Description': description,
+                'Date': formattedStartDate,
+                'StartTime': startTime,
+                'EndTime': endTime,
+                ...locationDetails,
+                'EventUrl': eventUrl,
+                'ImageURL': imageURL,
+                'Organizer': organizer,
+                'UUID': eventUUID
+            };
+
+            allEvents.push(eventInfo);
+
+            await page.goBack();
+        }
+
+        const nextButton = await page.$('button[data-spec="page-next"]');
+        if (nextButton) {
+            await nextButton.click();
+            await page.waitForTimeout(3000);
+        } else {
+            break;
+        }
+    }
+
+    await page.close();
+    return allEvents;
+}
+
 async function scrapeFacebookEvents(browser: Browser, url: string, maxScroll: number = 50): Promise<any[]> {
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'networkidle2' });
@@ -243,10 +376,16 @@ async function scrapeFacebookEvents(browser: Browser, url: string, maxScroll: nu
 (async () => {
     const browser = await puppeteer.launch({
         headless: false, // Mudar para false para abrir o navegador em modo visível
-        executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' // Certifique-se de que esse caminho está correto
+        // Remover o caminho para usar o navegador padrão do sistema
     });
 
     const sources = [
+        {
+            name: 'Eventbrite',
+            url: 'https://www.eventbrite.com/d/canada--montreal/all-events/',
+            scraper: scrapeEventbriteEvents,
+            maxPages: 3
+        },
         {
             name: 'Facebook',
             url: 'https://www.facebook.com/events/explore/montreal-quebec/102184499823699/',
@@ -258,7 +397,7 @@ async function scrapeFacebookEvents(browser: Browser, url: string, maxScroll: nu
     const allEvents: any[] = [];
     for (const source of sources) {
         console.log(`Scraping events from: ${source.name}`);
-        const events = await source.scraper(browser, source.url, source.maxScroll);
+        const events = await source.scraper(browser, source.url, source.maxPages || source.maxScroll);
         if (events) {
             allEvents.push(...events);
         } else {
